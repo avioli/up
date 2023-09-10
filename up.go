@@ -133,6 +133,7 @@ var (
 	initialCmd   = pflag.StringP("pipeline", "c", "", "initial `commands` to use as pipeline (default empty)")
 	bufsize      = pflag.Int("buf", 40, "input buffer size & pipeline buffer sizes in `megabytes` (MiB)")
 	noinput      = pflag.Bool("noinput", false, "start with empty buffer regardless if any input was provided")
+	maxInputH    = pflag.Int("max-input-Height", 5, "the maximum number of lines for the command")
 )
 
 func main() {
@@ -234,14 +235,28 @@ func main() {
 
 		// Draw UI
 		w, h := tui.Size()
+		// Compute the maximum height for the commandRegion - between 1 and 50% of available height
+		maxH := min(h-(h/2), max(1, *maxInputH))
+		// Define the command style
 		style := whiteOnBlue
 		if command == lastCommand {
 			style = whiteOnDBlue
 		}
-		stdinCapture.DrawStatus(TuiRegion(tui, 0, 0, 1, 1), style)
-		commandEditor.DrawTo(TuiRegion(tui, 1, 0, w-1, 1), style,
-			func(x, y int) { tui.ShowCursor(x+1, 0) })
-		commandOutput.DrawTo(TuiRegion(tui, 0, 1, w, h-1))
+		commandRegion := TuiRegion(tui, 1, 0, w-1, 1)
+		// Allow commandRegion to expand to a maximum height
+		commandRegion.MaxH = maxH
+		// Draw the commandEditor and get the last drawn rune's coordinates
+		x, y := commandEditor.DrawTo(commandRegion, style)
+		if y < maxH {
+			tui.ShowCursor(x+1, y)
+		} else {
+			tui.HideCursor()
+			y--
+		}
+		// Get the bottom y of the commandRegion, so the other regions can adapt
+		y2 := y + 1
+		stdinCapture.DrawStatus(TuiRegion(tui, 0, 0, 1, y2), style)
+		commandOutput.DrawTo(TuiRegion(tui, 0, y2, w, h-y2))
 		drawText(TuiRegion(tui, 0, h-1, w, 1), whiteOnBlue, message)
 		tui.Show()
 
@@ -346,7 +361,6 @@ func NewEditor(prompt, value string) *Editor {
 		prompt: []rune(prompt),
 		value:  v,
 		cursor: len(v),
-		lastw:  len(v),
 	}
 }
 
@@ -356,31 +370,20 @@ type Editor struct {
 	value     []rune
 	killspace []rune
 	cursor    int
-	// lastw is length of value on last Draw; we need it to know how much to erase after backspace
-	lastw int
 }
 
 func (e *Editor) String() string { return string(e.value) }
 
-func (e *Editor) DrawTo(region Region, style tcell.Style, setcursor func(x, y int)) {
-	// Draw prompt & the edited value - use white letters on blue background
-	for i, ch := range e.prompt {
-		region.SetCell(i, 0, style, ch)
-	}
-	for i, ch := range e.value {
-		region.SetCell(len(e.prompt)+i, 0, style, ch)
-	}
+func (e *Editor) DrawTo(region Region, style tcell.Style) (x, y int) {
+	// Clear the whole region
+	region.Clear()
 
-	// Clear remains of last value if needed
-	for i := len(e.value); i < e.lastw; i++ {
-		region.SetCell(len(e.prompt)+i, 0, tcell.StyleDefault, ' ')
-	}
-	e.lastw = len(e.value)
+	// Draw the prompt
+	x, line := region.DrawText(0, 0, style, e.prompt)
+	// Draw the edited value
+	x, line = region.DrawText(x, line, style, e.value)
 
-	// Show cursor if requested
-	if setcursor != nil {
-		setcursor(len(e.prompt)+e.cursor, 0)
-	}
+	return x, line
 }
 
 func (e *Editor) HandleKey(ev *tcell.EventKey) bool {
@@ -698,7 +701,7 @@ func (b *Buf) Pause(pause bool) {
 	b.mu.Unlock()
 }
 
-func (b *Buf) DrawStatus(region Region, style tcell.Style) {
+func (b *Buf) StatusChar() rune {
 	status := '~' // default: still reading input
 
 	b.mu.Lock()
@@ -712,6 +715,12 @@ func (b *Buf) DrawStatus(region Region, style tcell.Style) {
 	}
 	b.mu.Unlock()
 
+	return status
+}
+
+func (b *Buf) DrawStatus(region Region, style tcell.Style) {
+	region.Clear()
+	status := b.StatusChar()
 	region.SetCell(0, 0, style, status)
 }
 
@@ -862,22 +871,67 @@ fallback_print:
 }
 
 type Region struct {
-	W, H    int
-	SetCell func(x, y int, style tcell.Style, ch rune)
+	tui  tcell.Screen
+	X, Y int
+	W, H int
+	MaxH int
+}
+
+func (r *Region) InRegion(x, y int) bool {
+	return x >= 0 && x < r.W && y >= 0 && y < r.H
+}
+
+func (r *Region) SetCell(dx, dy int, style tcell.Style, ch rune) {
+	if r.InRegion(dx, dy) {
+		r.tui.SetContent(r.X+dx, r.Y+dy, ch, nil, style)
+	}
+}
+
+func (r *Region) DrawText(dx, dy int, style tcell.Style, text []rune) (int, int) {
+	if *noColors {
+		style = tcell.StyleDefault
+	}
+	x, y := dx, dy
+	for _, ch := range text {
+		r.tui.SetContent(r.X+x, r.Y+y, ch, nil, style)
+		x++
+		if x >= r.W {
+			y++
+			x = dx
+		}
+		if y >= r.H {
+			if r.H < r.MaxH {
+				r.Expand()
+			} else {
+				break
+			}
+		}
+	}
+	return x, y
+}
+
+func (r *Region) Expand() {
+	newH := r.H + 1
+	if newH <= r.MaxH {
+		r.H = newH
+		r.ClearRow(newH - 1)
+	}
+}
+
+func (r *Region) ClearRow(dy int) {
+	for dx := 0; dx < r.W; dx++ {
+		r.SetCell(dx, dy, tcell.StyleDefault, ' ')
+	}
+}
+
+func (r *Region) Clear() {
+	for y := 0; y <= r.H; y++ {
+		r.ClearRow(y)
+	}
 }
 
 func TuiRegion(tui tcell.Screen, x, y, w, h int) Region {
-	return Region{
-		W: w, H: h,
-		SetCell: func(dx, dy int, style tcell.Style, ch rune) {
-			if dx >= 0 && dx < w && dy >= 0 && dy < h {
-				if *noColors {
-					style = tcell.StyleDefault
-				}
-				tui.SetCell(x+dx, y+dy, style, ch)
-			}
-		},
-	}
+	return Region{tui: tui, X: x, Y: y, W: w, H: h}
 }
 
 var (
@@ -889,4 +943,18 @@ func drawText(region Region, style tcell.Style, text string) {
 	for x, ch := range text {
 		region.SetCell(x, 0, style, ch)
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
